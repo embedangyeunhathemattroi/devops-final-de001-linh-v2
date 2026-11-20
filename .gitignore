@@ -1,0 +1,11 @@
+student.env
+.practice/
+*.pem
+
+.gradle/
+.idea/
+build/
+student.env
+.practice/
+*.pem
+*.key

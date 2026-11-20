@@ -1,0 +1,183 @@
+# =============================================================================
+#  .github/workflows/ci-cd.yml - ĐÁP ÁN
+#  - Các bước không có TODO: ĐÃ VIẾT SẴN, không cần sửa.
+#  - Sinh viên điền các ô ______ tại các dòng TODO.
+#  - job build : kiểm tra student.env -> build & chạy thử -> smoke test -> push image GHCR
+#  - job deploy: SSH vào server -> cập nhật mã nguồn -> pull image -> khởi động lại
+# =============================================================================
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+
+# Tránh hai workflow cùng sửa thư mục deploy trên server.
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    env:
+      APP_TAG: ${{ github.sha }}
+      APP_VERSION: ${{ github.sha }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Kiểm tra thông tin trong student.env
+        run: |
+          set -a; source <(sed 's/\r$//' student.env); set +a
+          for v in STUDENT_NAME STUDENT_ID STUDENT_CLASS STUDENT_EMAIL GITHUB_USERNAME \
+                   EXAM_CODE APP_PORT COMPOSE_PROJECT_NAME MYSQL_DATABASE MYSQL_USER MYSQL_PASSWORD MYSQL_ROOT_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error file=student.env::Chưa điền $v trong student.env"
+              exit 1
+            fi
+          done
+
+          # BO SUNG CI-02: bắt lỗi port, tên project và thông số đề trước khi build.
+          if ! [[ "$APP_PORT" =~ ^[1-9][0-9]{3,4}$ ]] || (( APP_PORT < 8080 || APP_PORT > 65535 )); then
+            echo "::error file=student.env::APP_PORT phải là số nguyên từ 8080 đến 65535"
+            exit 1
+          fi
+          [[ "$COMPOSE_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9-]*-de001$ ]] || { echo '::error::Tên project phải viết thường và kết thúc -de001'; exit 1; }
+          [[ "$EXAM_CODE" == '001' && "$MYSQL_DATABASE" == 'ptit_lab_db' ]] || { echo '::error::Không đổi mã đề hoặc tên database'; exit 1; }
+          docker compose --env-file student.env config --quiet
+          echo "### Sinh viên: $STUDENT_NAME - $STUDENT_ID - $STUDENT_CLASS" >> "$GITHUB_STEP_SUMMARY"
+
+
+
+      - name: Đặt tên image
+        id: meta
+        run: echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}/app" >> "$GITHUB_OUTPUT"
+
+      - name: Build & chạy thử bằng Docker Compose
+        env:
+          APP_IMAGE: ${{ steps.meta.outputs.image }}
+          APP_TAG: ${{ github.sha }}
+          APP_VERSION: ${{ github.sha }}
+        # TODO 1: build và khởi động toàn bộ hệ thống bằng Docker Compose (đọc student.env),
+        #         chờ các service sẵn sàng (gợi ý: --wait --wait-timeout 300)
+        run: docker compose --env-file student.env up -d --build --wait --wait-timeout 300
+
+      - name: Smoke test
+        run: |
+          set -a; source <(sed 's/\r$//' student.env); set +a
+          BASE="http://localhost:${APP_PORT}"
+          # Kiểm tra endpoint $BASE/api/labs trả về JSON (CÓ SẴN, lỗi -> pipeline FAIL)
+          curl -fsS --retry 12 --retry-delay 5 --retry-all-errors --connect-timeout 5 --max-time 15 "$BASE/api/labs" -o /tmp/devops-labs.json
+          python3 -c 'import json; d=json.load(open("/tmp/devops-labs.json")); assert isinstance(d, list) and len(d) == 8; assert all(isinstance(row, dict) and "id" in row for row in d)'
+          curl -fsS "$BASE/api/info" -o /tmp/devops-info.json
+          python3 -c 'import json,os; d=json.load(open("/tmp/devops-info.json")); assert d["appVersion"] == os.environ["GITHUB_SHA"]; assert d["studentId"] == os.environ["STUDENT_ID"]; assert d["studentName"] == os.environ["STUDENT_NAME"]'
+          curl -fsS "$BASE/student.html" -o /dev/null
+          echo "Smoke test OK"
+
+      - name: In log khi lỗi
+        if: failure()
+        run: docker compose --env-file student.env logs --no-color
+
+      # TODO 2: đăng nhập GHCR bằng tài khoản github.actor và secrets.GITHUB_TOKEN
+      - name: Đăng nhập GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image lên GHCR
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        # TODO 3: push image với 2 tag: commit SHA (github.sha) và latest
+        run: |
+          docker push "$IMAGE:${{ github.sha }}"
+          docker tag "$IMAGE:${{ github.sha }}" "$IMAGE:latest"
+          docker push "$IMAGE:latest"
+
+      - name: Dọn dẹp
+        if: always()
+        run: docker compose --env-file student.env down -v
+
+  deploy:
+    name: Deploy lên server
+    if: github.ref == 'refs/heads/main'
+    # TODO 4: chỉ chạy khi job build thành công
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Deploy qua SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          APP_IMAGE: ${{ needs.build.outputs.image }}
+          APP_TAG: ${{ github.sha }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          DEPLOY_DIR: ${{ github.event.repository.name }}
+        with:
+          # TODO 5: kết nối bằng các GitHub Secrets SERVER_HOST, SERVER_USER, SERVER_SSH_KEY
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          command_timeout: 15m
+          envs: APP_IMAGE,APP_TAG,GHCR_USER,GHCR_TOKEN,REPO_URL,DEPLOY_DIR
+          script: |
+            set -e
+            case "$DEPLOY_DIR" in dev|devops-final-de001-*) ;; *) echo 'Invalid deploy directory'; exit 1 ;; esac
+            if [ -e "$HOME/$DEPLOY_DIR" ] && [ ! -d "$HOME/$DEPLOY_DIR/.git" ]; then
+              echo 'Deploy path already exists without a repository; inspect it manually'; exit 1
+            fi
+            if [ -d "$HOME/$DEPLOY_DIR/.git" ]; then
+              CURRENT_REMOTE=$(git -C "$HOME/$DEPLOY_DIR" remote get-url origin)
+              test "$CURRENT_REMOTE" = "$REPO_URL" || { echo 'Deploy directory belongs to another repository'; exit 1; }
+            fi
+            if [ ! -d "$HOME/$DEPLOY_DIR/.git" ]; then
+              git clone "$REPO_URL" "$HOME/$DEPLOY_DIR"
+            fi
+            cd "$HOME/$DEPLOY_DIR"
+            git remote set-url origin "$REPO_URL"
+            git fetch origin main
+            # Thư mục này dành riêng cho pipeline; không sửa tay file trên server.
+            git reset --hard "$APP_TAG"
+            # Dùng cấu hình đăng nhập tạm, không thay tài khoản Docker có sẵn trên server.
+            DOCKER_CONFIG=$(mktemp -d)
+            export DOCKER_CONFIG
+            trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            export APP_IMAGE APP_TAG
+            # TODO 6: kéo image mới của service app về, rồi khởi động lại hệ thống
+            #         KHÔNG build trên server (gợi ý: pull app, up -d --no-build)
+            docker compose --env-file student.env pull app
+            docker compose --env-file student.env up -d --no-build --wait --wait-timeout 300
+            # BO SUNG CI-06: Nginx phân giải lại IP app sau khi container app được thay mới.
+            docker compose --env-file student.env restart nginx
+            # Đọc port từ Compose để hỗ trợ cả giá trị có và không có dấu ngoặc kép.
+            APP_PORT=$(docker compose --env-file student.env port nginx 80 | head -n 1 | awk -F: '{print $NF}')
+            test -n "$APP_PORT"
+            curl -fsS --retry 12 --retry-delay 5 --retry-all-errors --connect-timeout 5 --max-time 15 "http://127.0.0.1:${APP_PORT}/api/labs" -o "$DOCKER_CONFIG/labs.json"
+            grep -q '"id"' "$DOCKER_CONFIG/labs.json"
+            curl -fsS "http://127.0.0.1:${APP_PORT}/api/info" -o "$DOCKER_CONFIG/info.json"
+            grep -Fq "$APP_TAG" "$DOCKER_CONFIG/info.json"
+            curl -fsS "http://127.0.0.1:${APP_PORT}/student.html" -o /dev/null
+            # Xác nhận container đang dùng đúng image đã pull theo commit SHA.
+            APP_CONTAINER=$(docker compose --env-file student.env ps -q app)
+            test -n "$APP_CONTAINER"
+            EXPECTED_IMAGE=$(docker image inspect "$APP_IMAGE:$APP_TAG" --format '{{.Id}}')
+            ACTUAL_IMAGE=$(docker inspect "$APP_CONTAINER" --format '{{.Image}}')
+            test "$ACTUAL_IMAGE" = "$EXPECTED_IMAGE"
+            docker compose --env-file student.env ps
